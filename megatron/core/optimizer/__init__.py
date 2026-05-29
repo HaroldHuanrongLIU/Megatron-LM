@@ -739,7 +739,7 @@ def _tag_muon_split_qkv_parameters(
       along the row dimension. The splits will be orthogonalized independently.
 
       For example, without an Attention output gate, we have the following for the fused/packed
-      standard Multi-Head Attention QKV projection:
+      standard Multi-Head Attention QKV projection when not using tensor model parallelism:
 
       ```
       # Remember that PyTorch uses transposed weights.
