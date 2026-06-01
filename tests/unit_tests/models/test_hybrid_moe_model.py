@@ -36,6 +36,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "actual_vocab_size": 131072,
     "add_bias_linear": False,
     "add_qkv_bias": False,
+    "apply_dsa_kernel_fusion": True,
     "apply_query_key_layer_scaling": False,
     "apply_residual_connection_post_layernorm": False,
     "apply_rope_fusion": False,
@@ -217,6 +218,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dropping": False,
     "moe_z_loss_coeff": None,
     "moe_enable_routing_replay": False,
+    "mrope_interleaved": False,
     "mrope_section": None,
     "mup_attn_scale_power": 1.0,
     "mup_base_head_dim": None,
@@ -336,6 +338,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
+    "head_wise_attn_gate": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

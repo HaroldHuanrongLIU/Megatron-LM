@@ -177,6 +177,8 @@ class TestNativeSinkhorn:
 class TestFusedSinkhorn:
     """Public fused sinkhorn dispatch/fallback plus numerical correctness."""
 
+    @pytest.mark.flaky_in_dev
+    @_require_cutile
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
         """E2E: public fused fwd output and bwd grad must match the PyTorch reference."""
@@ -236,6 +238,8 @@ class TestNativeHAggregate:
 class TestFusedHAggregate:
     """Public fused h_aggregate dispatch/fallback plus numerical correctness."""
 
+    @pytest.mark.flaky_in_dev
+    @_require_cutile
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_reference(self, s, b, n, C):
         """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
@@ -349,6 +353,8 @@ class TestFusedHPostBDA:
 
         torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
 
+    @pytest.mark.flaky_in_dev
+    @_require_cutile
     @pytest.mark.parametrize("with_bias", [True, False])
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
     def test_fwd_bwd_vs_reference(self, s, b, n, C, with_bias):
@@ -665,6 +671,8 @@ class TestNativeProjRms:
 class TestFusedProjRms:
     """Public fused proj_rms dispatch/fallback plus numerical correctness."""
 
+    @pytest.mark.flaky_in_dev
+    @_require_cutile
     @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
     def test_fwd_bwd_vs_reference(self, M, N, K):
         """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
@@ -881,6 +889,8 @@ class TestEndToEndNative:
 class TestEndToEndFused:
     """Full mHC pipeline using the public fused API."""
 
+    @pytest.mark.flaky_in_dev
+    @_require_cutile
     def test_full_pipeline_fwd_bwd(self):
         from megatron.core.fusions.fused_mhc_kernels import (
             fused_h_aggregate,

@@ -256,12 +256,26 @@ class TransformerConfig(ModelParallelConfig):
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
     attention_output_gate: bool = False
-    """Whether to apply output gate to the attention layers."""
+    """Apply a full head_dim output gate (num_attention_heads * head_dim rows
+    fused inline per-group [q, gate, k, v] into linear_qkv). Mutually
+    exclusive with `head_wise_attn_gate` (per-head scalar gate)."""
 
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
     the shared model-level rotary_pos_emb is not created."""
+
+    head_wise_attn_gate: bool = False
+    """Apply a per-head scalar output gate (Step-3.5-Flash g_proj):
+    num_attention_heads scalar gates fused as the trailing rows of
+    linear_qkv; sigmoid scales each head uniformly across head_dim.
+    Contrast with `attention_output_gate` (full head_dim gate, inline
+    per-group); the two are mutually exclusive. Self-attention only.
+    dist-ckpt TP resharding is handled by a ShardedTensorFactory in
+    SelfAttention.sharded_state_dict. Requires (validated in
+    __post_init__): num_attention_heads % tp == 0,
+    num_query_groups >= tp, and under fp8/fp4 a per-partition
+    linear_qkv_out_dim aligned to 16/32."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -322,6 +336,11 @@ class TransformerConfig(ModelParallelConfig):
     csa_dense_mode: bool = False
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
+
+    apply_dsa_kernel_fusion: bool = False
+    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
+    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
+    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
 
     ####################
     # linear attention
@@ -1150,6 +1169,12 @@ class TransformerConfig(ModelParallelConfig):
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
 
+    mrope_interleaved: bool = False
+    """When True, use the interleaved T/H/W MRoPE layout (Qwen3.5-VL style) where
+    H freqs occupy stride-3 positions {1,4,7,...} and W freqs occupy {2,5,8,...}.
+    When False (default), use the original section-based layout (Qwen2-VL style)
+    that cycles through T/H/W per mrope_section chunk."""
+
     is_hybrid_model: bool = False
     """ Indicates whether this is a hybrid model. """
 
@@ -1316,6 +1341,47 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.head_wise_attn_gate:
+            tp = self.tensor_model_parallel_size
+            if self.attention_output_gate:
+                raise ValueError(
+                    "head_wise_attn_gate and attention_output_gate cannot both be enabled "
+                    "(incompatible linear_qkv row layouts)."
+                )
+            if self.num_attention_heads % tp != 0:
+                raise ValueError(
+                    f"head_wise_attn_gate requires num_attention_heads "
+                    f"({self.num_attention_heads}) divisible by tp ({tp})."
+                )
+            # The gate peel-off in SelfAttention runs before the
+            # num_query_groups < world_size AllGather+reslice fallback, so the
+            # gate cannot ride that path without over-taking V/K rows.
+            if self.num_query_groups < tp:
+                raise ValueError(
+                    f"head_wise_attn_gate requires num_query_groups "
+                    f"({self.num_query_groups}) >= tp ({tp})."
+                )
+            # TE FP8/FP4 GEMM requires per-partition output dim aligned to
+            # 16/32. attention_output_gate's wider gate gets this for free;
+            # head_wise's num_attention_heads-row increment can mis-align.
+            if self.fp8 is not None or self.fp4 is not None:
+                align = 32 if self.fp4 is not None else 16
+                linear_qkv_out_dim = (
+                    self.kv_channels * self.num_attention_heads
+                    + 2 * self.kv_channels * self.num_query_groups
+                    + self.num_attention_heads
+                )
+                per_partition = linear_qkv_out_dim // tp
+                if per_partition % align != 0:
+                    fp_name = "fp4" if self.fp4 is not None else "fp8"
+                    raise ValueError(
+                        f"head_wise_attn_gate under {fp_name} requires per-partition "
+                        f"linear_qkv output dim ({per_partition}) to be a multiple of "
+                        f"{align}; got num_attention_heads={self.num_attention_heads}, "
+                        f"num_query_groups={self.num_query_groups}, "
+                        f"kv_channels={self.kv_channels}, tp={tp}."
+                    )
+
         if self.linear_attention_type is not None:
             warnings.warn(
                 "linear_attention_type is deprecated, "
@@ -1380,6 +1446,44 @@ class TransformerConfig(ModelParallelConfig):
             ), "DSv4 Hybrid Attention only supports TP size 1."
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
+
+            if self.apply_dsa_kernel_fusion:
+                assert (
+                    torch.cuda.is_available()
+                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+                sm = torch.cuda.get_device_capability()
+                assert sm[0] >= 10, (
+                    f"apply_dsa_kernel_fusion requires SM100+ (Blackwell or later), "
+                    f"but current device has compute capability {sm[0]}.{sm[1]}."
+                )
+
+                _flash_mla_available = True
+                try:
+                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+                except ImportError:
+                    _flash_mla_available = False
+
+                _cudnn_dsa_available = True
+                try:
+                    from cudnn import DSA  # noqa: F401
+                except ImportError:
+                    _cudnn_dsa_available = False
+
+                if not _flash_mla_available or not _cudnn_dsa_available:
+                    missing = []
+                    if not _flash_mla_available:
+                        missing.append(
+                            "flash_mla (install from "
+                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
+                        )
+                    if not _cudnn_dsa_available:
+                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+                    raise ValueError(
+                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
+                        f"following packages are not available: {', '.join(missing)}. "
+                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
+                        f"PyTorch fallback."
+                    )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2742,9 +2846,13 @@ class TransformerConfig(ModelParallelConfig):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
         if self.rotary_base_per_layer is not None:
-            assert len(self.rotary_base_per_layer) == self.num_layers, (
+            if self.mtp_num_layers is not None:
+                total_num_layers = self.num_layers + self.mtp_num_layers
+            else:
+                total_num_layers = self.num_layers
+            assert len(self.rotary_base_per_layer) == total_num_layers, (
                 f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
-                f"must equal num_layers ({self.num_layers})"
+                f"must equal num_layers ({total_num_layers})"
             )
 
         if self.no_rope_freq:
@@ -2828,10 +2936,9 @@ class TransformerConfig(ModelParallelConfig):
             # Needed for passing variable sequences between pp stages.
             self.variable_seq_lengths = True
 
-            # TODO(tailaim): add support for other dispatcher types
-            assert self.moe_token_dispatcher_type == "alltoall", (
-                f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
-                f"got '{self.moe_token_dispatcher_type}'"
+            assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                f"sequence_packing only supports moe_token_dispatcher_type in "
+                f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
             )
 
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
@@ -2922,7 +3029,12 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+        if (
+            self.multi_latent_attention
+            and self.apply_rope_fusion
+            and self.rope_type != "yarn"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
         if self.attention_output_gate:
